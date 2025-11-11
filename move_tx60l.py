@@ -1,17 +1,26 @@
 """
-Main entry point that drives the Staubli TX60L arm via reusable helpers.
+TX60L motion driver with three runtime modes controlled via keyboard:
 
-使用的函式/類別:
-- ensure_basic_lighting(): 建立環境光與太陽光，讓匯入的模型不會變黑。
-- create_world() & add_ground_plane(): 建立物理世界並鋪地板，避免手臂掉落。
-- import_robot_from_urdf(): 將 URDF 轉成場景中的可控 Robot 物件。
-- JointMotionController: 提供 clamp、move_smooth、play_keyframes 等控制介面。
-- wait_for_manual_gui_close(): 腳本跑完後保持 GUI，方便觀察結果。
+A 模式 (按鍵 1): 依序執行預設的多段關節動作並持續循環。
+B 模式 (按鍵 2): 急停，立即維持當前姿勢並可隨時回到 A 繼續未完成的循環。
+C 模式 (按鍵 3): 回到初始 home 姿勢並維持；若 C 後再切回 A，整個循環會從頭開始。
+
+關閉 Isaac Sim GUI 之前，腳本會持續執行上述狀態機；GUI 關閉才算整個程式結束。
 """
+
+from __future__ import annotations
+
+import enum
+from typing import Tuple
 
 from isaacsim import SimulationApp
 
 simulation_app = SimulationApp({"headless": False})
+
+import carb  # noqa: E402  pylint: disable=wrong-import-position
+import omni.appwindow  # noqa: E402  pylint: disable=wrong-import-position
+import omni.usd  # noqa: E402  pylint: disable=wrong-import-position
+from pxr import Gf, UsdGeom  # noqa: E402  pylint: disable=wrong-import-position
 
 from joint_def import (  # noqa: E402  pylint: disable=wrong-import-position
     Keyframe,
@@ -22,16 +31,199 @@ from joint_def import (  # noqa: E402  pylint: disable=wrong-import-position
     import_robot_from_urdf,
     wait_for_manual_gui_close,
 )
-from pxr import Gf, UsdGeom
-import omni.usd
-from typing import Tuple
 
-# === 你的 URDF 絕對路徑（請確認這個檔存在） ===
-URDF_ABS = "/home/scl114/Documents/urdf_files_dataset-main/urdf_files/ros-industrial/xacro_generated/staubli/staubli_tx60_support/urdf/tx60l.urdf"
+
+class Mode(enum.Enum):
+    """High-level operating modes toggled via keyboard."""
+
+    LOOP = "A"
+    PAUSE = "B"
+    RETURNING = "C_return"
+    HOME = "C_hold"
+
+
+class LoopRoutine:
+    """Non-blocking keyframe player that can pause/resume across segments."""
+
+    def __init__(self, controller: JointMotionController, keyframes):
+        self._controller = controller
+        self._targets = [controller.clamp(k.pose) for k in keyframes]
+        self._durations = [max(1e-3, k.duration) for k in keyframes]
+        self._segment = 0
+        self._elapsed = 0.0
+        self._segment_start = controller.current_pose()
+        self._active = False
+
+    def reset_cycle(self):
+        self._segment = 0
+        self._elapsed = 0.0
+        self._segment_start = self._controller.current_pose()
+
+    def resume(self):
+        self._active = True
+
+    def pause(self):
+        self._active = False
+
+    def update(self, dt: float):
+        if not self._active or not self._targets:
+            return
+
+        target = self._targets[self._segment]
+        duration = self._durations[self._segment]
+        alpha = min(1.0, self._elapsed / duration)
+        pose = [
+            self._segment_start[i] + (target[i] - self._segment_start[i]) * alpha
+            for i in range(self._controller.dof_count)
+        ]
+        self._controller.apply_pose(pose)
+        self._elapsed += dt
+
+        if self._elapsed >= duration:
+            self._segment = (self._segment + 1) % len(self._targets)
+            self._elapsed = 0.0
+            self._segment_start = self._controller.current_pose()
+
+
+class ReturnHomeAction:
+    """Single-shot blend back to the provided home pose."""
+
+    def __init__(self, controller: JointMotionController, home_pose, duration: float = 2.0):
+        self._controller = controller
+        self._home = controller.clamp(home_pose)
+        self._duration = max(1e-3, duration)
+        self._active = False
+        self._elapsed = 0.0
+        self._start = self._home
+
+    def start(self):
+        self._active = True
+        self._elapsed = 0.0
+        self._start = self._controller.current_pose()
+
+    def stop(self):
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def update(self, dt: float) -> bool:
+        if not self._active:
+            return True
+
+        alpha = min(1.0, self._elapsed / self._duration)
+        pose = [
+            self._start[i] + (self._home[i] - self._start[i]) * alpha
+            for i in range(self._controller.dof_count)
+        ]
+        self._controller.apply_pose(pose)
+        self._elapsed += dt
+
+        if self._elapsed >= self._duration:
+            self._controller.apply_pose(self._home)
+            self._active = False
+            return True
+        return False
+
+
+class ModeManager:
+    """Coordinates keyboard commands with the underlying motion primitives."""
+
+    def __init__(self, controller, home_pose, routine: LoopRoutine):
+        self._controller = controller
+        self._home_pose = controller.clamp(home_pose)
+        self._routine = routine
+        self._return_home = ReturnHomeAction(controller, self._home_pose, duration=2.5)
+        self._mode = Mode.HOME
+        self._hold_pose = self._home_pose[:]
+        self._cycle_reset_pending = True
+
+    def handle_mode_request(self, requested: Mode):
+        if requested == Mode.LOOP:
+            self._enter_loop()
+        elif requested == Mode.PAUSE:
+            self._enter_pause()
+        elif requested == Mode.RETURNING:
+            self._enter_return()
+
+    def update(self, dt: float):
+        if self._mode == Mode.LOOP:
+            self._routine.update(dt)
+        elif self._mode == Mode.PAUSE:
+            self._controller.apply_pose(self._hold_pose)
+        elif self._mode == Mode.RETURNING:
+            finished = self._return_home.update(dt)
+            if finished:
+                self._mode = Mode.HOME
+                self._hold_pose = self._home_pose[:]
+                print("[mode] 已回到 C 模式：保持 home 姿勢。")
+
+        if self._mode == Mode.HOME:
+            self._controller.apply_pose(self._home_pose)
+
+    def _enter_loop(self):
+        if self._cycle_reset_pending:
+            self._routine.reset_cycle()
+        self._return_home.stop()
+        self._mode = Mode.LOOP
+        self._cycle_reset_pending = False
+        self._routine.resume()
+        print("[mode] A 模式啟動：開始 / 持續循環動作。")
+
+    def _enter_pause(self):
+        self._return_home.stop()
+        self._routine.pause()
+        self._hold_pose = self._controller.current_pose()
+        self._mode = Mode.PAUSE
+        print("[mode] B 模式：急停並保持目前姿勢。")
+
+    def _enter_return(self):
+        self._routine.pause()
+        self._return_home.start()
+        self._mode = Mode.RETURNING
+        self._cycle_reset_pending = True
+        print("[mode] C 模式：回到 home 姿勢並鎖定。")
+
+
+class KeyboardModeSwitcher:
+    """Registers keyboard shortcuts that map to Mode commands."""
+
+    def __init__(self, mode_manager: ModeManager):
+        self._mode_manager = mode_manager
+        self._input = carb.input.acquire_input_interface()
+        self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+        self._subscription = self._input.subscribe_to_keyboard_events(
+            self._keyboard, self._on_keyboard_event
+        )
+
+    def shutdown(self):
+        if self._subscription is not None:
+            self._input.unsubscribe_to_keyboard_events(self._keyboard, self._subscription)
+            self._subscription = None
+        if self._input is not None:
+            if hasattr(carb.input, "release_input_interface"):
+                carb.input.release_input_interface(self._input)
+            self._input = None
+
+    def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
+        if event.type != carb.input.KeyboardEventType.KEY_PRESS:
+            return False
+
+        if event.input == carb.input.KeyboardInput.KEY_1:
+            self._mode_manager.handle_mode_request(Mode.LOOP)
+            return True
+        if event.input == carb.input.KeyboardInput.KEY_2:
+            self._mode_manager.handle_mode_request(Mode.PAUSE)
+            return True
+        if event.input == carb.input.KeyboardInput.KEY_3:
+            self._mode_manager.handle_mode_request(Mode.RETURNING)
+            return True
+        return False
 
 
 def _build_keyframes(home_pose):
-    """Precompute a few joint-space poses for the sample routine."""
+    """Preset poses used for the looping routine."""
     reach_forward = home_pose.copy()
     reach_forward[0] += 0.3
     reach_forward[1] = -0.4
@@ -135,25 +327,26 @@ def main():
 
     controller = JointMotionController(robot)
     home = controller.home_pose([0.0, -0.8, 1.2, 0.0, 1.4, 0.0])
+    routine = LoopRoutine(controller, _build_keyframes(home))
+
+    mode_manager = ModeManager(controller, home, routine)
+    keyboard = KeyboardModeSwitcher(mode_manager)
     _place_observer_camera(robot.prim_path)
 
-    print("[motion] Moving to home pose...")
-    controller.move_smooth(world, home, duration=2.0)
-    print("[motion] Playing keyframe routine...")
-    controller.play_keyframes(world, _build_keyframes(home))
+    print("[controls] 1 → A 模式 | 2 → B 模式 | 3 → C 模式。關閉 GUI 以結束程式。")
+    mode_manager.handle_mode_request(Mode.LOOP)  # 預設開啟 A 模式
 
-    print("[motion] Oscillating selected joints...")
-    controller.oscillate(
-        world,
-        base_pose=home,
-        joints=[0, 1, 3, 5],
-        amplitude=0.3,
-        frequency=0.35,
-        duration=8.0,
-    )
+    try:
+        while simulation_app.is_running():
+            dt = world.get_physics_dt()
+            mode_manager.update(dt)
+            world.step(render=True)
+    finally:
+        keyboard.shutdown()
 
-    print("[motion] Holding home pose...")
-    controller.hold_pose(world, home, duration=0.5)
+
+# === 你的 URDF 絕對路徑（請確認這個檔存在） ===
+URDF_ABS = "/home/scl114/Documents/urdf_files_dataset-main/urdf_files/ros-industrial/xacro_generated/staubli/staubli_tx60_support/urdf/tx60l.urdf"
 
 
 if __name__ == "__main__":

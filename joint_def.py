@@ -259,6 +259,19 @@ class JointMotionController:
         """
         return self._robot.get_joint_positions().tolist()
 
+    def apply_pose(self, pose: Sequence[float]) -> None:
+        """
+        Immediately command the robot to a pose (單步位置控制).
+
+        Args:
+            pose: 目標關節角列表。若角度過大超出限制，會先經 clamp 截斷；
+                若長度不足則自動 padding。過小（僅 1~2 軸）也可，未指定的軸會沿用當前值。
+        用途:
+            - 即時維持姿勢（例如急停 hold）。
+            - 逐步內插時每個 simulation step 呼叫本函式送出新 pose。
+        """
+        self._robot.apply_action(ArticulationAction(joint_positions=self.clamp(pose)))
+
     def home_pose(self, fallback: Sequence[float] | None = None) -> List[float]:
         """
         Return a sanitized home pose, optionally using a provided fallback.
