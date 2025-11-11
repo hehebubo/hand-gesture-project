@@ -1,114 +1,164 @@
-# move_tx60l_from_urdf.py
-# 從本地 URDF 匯入 Staubli TX60L，進場後以關節角控制；程式會跟 GUI 生命週期一起跑，關 GUI 才會結束。
+"""
+Main entry point that drives the Staubli TX60L arm via reusable helpers.
 
-import os, math
-import numpy as np
+使用的函式/類別:
+- ensure_basic_lighting(): 建立環境光與太陽光，讓匯入的模型不會變黑。
+- create_world() & add_ground_plane(): 建立物理世界並鋪地板，避免手臂掉落。
+- import_robot_from_urdf(): 將 URDF 轉成場景中的可控 Robot 物件。
+- JointMotionController: 提供 clamp、move_smooth、play_keyframes 等控制介面。
+- wait_for_manual_gui_close(): 腳本跑完後保持 GUI，方便觀察結果。
+"""
+
 from isaacsim import SimulationApp
+
 simulation_app = SimulationApp({"headless": False})
-from pxr import Gf, UsdGeom, UsdLux
+
+from joint_def import (  # noqa: E402  pylint: disable=wrong-import-position
+    Keyframe,
+    JointMotionController,
+    add_ground_plane,
+    create_world,
+    ensure_basic_lighting,
+    import_robot_from_urdf,
+    wait_for_manual_gui_close,
+)
+from pxr import Gf, UsdGeom
 import omni.usd
-
-# ---- Isaac Sim Core (沿用舊命名空間，會有 deprecate 警告但可用) ----
-from omni.isaac.core import World
-from omni.isaac.core.robots import Robot
-from omni.isaac.core.utils.types import ArticulationAction
-from omni.isaac.core.objects.ground_plane import GroundPlane
-
-# ---- URDF Importer (新 API) ----
-from isaacsim.asset.importer.urdf import _urdf  # 官方文件示例用法
-urdf_interface = _urdf.acquire_urdf_interface()
-import_cfg = _urdf.ImportConfig()
-import_cfg.set_merge_fixed_joints(False)     # 不合併 fixed joints（保留原關節）
-import_cfg.set_fix_base(True)                # 固定底座
-import_cfg.set_make_default_prim(True)       # 設定為 default prim
-import_cfg.set_create_physics_scene(True)    # 若空場景，自動建立 physics scene
+from typing import Tuple
 
 # === 你的 URDF 絕對路徑（請確認這個檔存在） ===
 URDF_ABS = "/home/scl114/Documents/urdf_files_dataset-main/urdf_files/ros-industrial/xacro_generated/staubli/staubli_tx60_support/urdf/tx60l.urdf"
-URDF_DIR, URDF_FILE = os.path.split(URDF_ABS)
-
-# 解析並匯入到當前開啟的 Stage（in-memory）
-parsed_robot = urdf_interface.parse_urdf(URDF_DIR, URDF_FILE, import_cfg)
-# getArticulationRoot=True 會回傳 articulation root 的 prim path，方便後續掛 Robot 控制
-tx_root_prim = urdf_interface.import_robot(URDF_DIR, URDF_FILE, parsed_robot, import_cfg, "", True)
-
-# ---- 建世界與地板 ----
-world = World(stage_units_in_meters=1.0)
-ground_color = np.array([0.9, 0.9, 0.9], dtype=np.float32)
-world.scene.add(GroundPlane("/World/Ground", size=20, color=ground_color))
 
 
-def ensure_basic_lighting():
-    """Add simple dome + distant lights so the scene isn't black."""
+def _build_keyframes(home_pose):
+    """Precompute a few joint-space poses for the sample routine."""
+    reach_forward = home_pose.copy()
+    reach_forward[0] += 0.3
+    reach_forward[1] = -0.4
+    reach_forward[2] = 0.9
+    reach_forward[3] = -0.3
+    reach_forward[4] = 1.2
+    reach_forward[5] = 0.6
+
+    prep_pick = home_pose.copy()
+    prep_pick[0] -= 0.4
+    prep_pick[1] = -0.6
+    prep_pick[2] = 1.1
+    prep_pick[3] = 0.4
+    prep_pick[4] = 0.9
+    prep_pick[5] = -0.5
+
+    lift_high = home_pose.copy()
+    lift_high[1] = -0.3
+    lift_high[2] = 1.4
+    lift_high[3] = 0.2
+    lift_high[4] = 1.3
+    lift_high[5] = 0.0
+
+    return [
+        Keyframe(pose=home_pose.copy(), duration=0.7),
+        Keyframe(pose=reach_forward, duration=1.2),
+        Keyframe(pose=prep_pick, duration=1.0),
+        Keyframe(pose=lift_high, duration=1.0),
+        Keyframe(pose=home_pose.copy(), duration=0.8),
+    ]
+
+
+def _compute_robot_focus(prim_path: str) -> Tuple[Gf.Vec3d, Gf.Vec3d]:
+    """
+    Estimate a good camera target/offset from the robot bounding box.
+
+    Returns:
+        (target, offset): target 是 bbox 中心上方 10% 高的位置，
+        offset 則朝負 X、正 Y 方向退後並抬高，避免鏡頭位於地面以下。
+    """
     stage = omni.usd.get_context().get_stage()
-    if not stage.GetPrimAtPath("/World/EnvLight"):
-        dome = UsdLux.DomeLight.Define(stage, "/World/EnvLight")
-        dome.CreateIntensityAttr(150.0)  # 全天域環境光的強度（數值越大越亮）
-        dome.CreateSpecularAttr(0.1)     # 控制反射高光占比（越大越亮、越鏡面）
-    if not stage.GetPrimAtPath("/World/SunLight"):
-        sun = UsdLux.DistantLight.Define(stage, "/World/SunLight")
-        sun.CreateIntensityAttr(10000.0)        # 平行光（太陽光）強度
-        sun.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.92))  # 太陽光顏色，偏暖白
-        xform = UsdGeom.Xformable(sun)
-        xform.AddRotateYOp().Set(-45.0)  # 先繞 Y 旋轉，決定水平入射方向
-        xform.AddRotateXOp().Set(-60.0)  # 再繞 X 旋轉，決定入射高度角
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim:
+        return Gf.Vec3d(0.0, 0.0, 0.8), Gf.Vec3d(-1.8, 0.8, 0.9)
+
+    try:
+        bbox_cache = UsdGeom.BBoxCache(0.0, ["default"])
+        bbox = bbox_cache.ComputeWorldBound(prim)
+        box = bbox.GetBox()
+        center = box.GetCenter()
+        size = box.GetSize()
+        target = center + Gf.Vec3d(0.0, 0.0, max(0.05, size[2] * 0.1))
+        offset = Gf.Vec3d(
+            -max(1.2, size[0] * 1.5),
+            max(0.6, size[1] * 0.7),
+            max(0.9, size[2] * 0.9),
+        )
+        return target, offset
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[camera] Failed to compute bbox ({exc}), using fallback placement.")
+        return Gf.Vec3d(0.0, 0.0, 0.8), Gf.Vec3d(-1.8, 0.8, 0.9)
 
 
-ensure_basic_lighting()
+def _place_observer_camera(robot_prim_path: str) -> None:
+    """
+    Spawn/align a camera near the arm so 觀察角度固定.
 
-# ---- 用剛匯入的 prim 當 Robot 控制目標 ----
-tx60l = world.scene.add(Robot(prim_path=tx_root_prim, name="tx60l"))
-world.reset()
+    Args:
+        robot_prim_path: Robot 的 articulation root，用來估算 bbox。
+            若路徑錯誤會退回預設位置。
+    """
+    stage = omni.usd.get_context().get_stage()
+    cam_path = "/World/ArmObserver"
+    camera = UsdGeom.Camera.Get(stage, cam_path)
+    if not camera:
+        camera = UsdGeom.Camera.Define(stage, cam_path)
+        camera.CreateFocalLengthAttr(24.0)
 
-# 讀 DOF 與限制
-dof_names = tx60l.dof_names
-dof_props = tx60l.dof_properties
-lower = dof_props["lower"].tolist()
-upper = dof_props["upper"].tolist()
-
-def clamp(q): # 將關節角 q 限制在 lower ~ upper 範圍內
-    return [max(lower[i], min(upper[i], q[i])) for i in range(len(q))]
-
-# 設定一個 home（6 軸；單位 rad），若模型多 DOF 就截斷
-home = [0.0, -0.8, 1.2, 0.0, 1.4, 0.0]
-home = home[:len(dof_names)]
-home = clamp(home)
-
-
-def wait_for_manual_gui_close(): #此函式用來保持 GUI 開啟
-    """Keep GUI alive after script ends so the user can close it manually."""
-    if not simulation_app.is_running():
-        return
-    print("動作結束，請手動關閉 Isaac Sim GUI 視窗以結束程式。")
-    while simulation_app.is_running():
-        simulation_app.update()
-
-
-# 先平滑回 home（約 2 秒），再讓關節 1 做正弦擺動；整體直到關 GUI 才結束
-phase = "go_home"
-t = 0.0
-step_counter = 0
-steps_to_home = 2 * 60  # 2 秒（假設 60FPS）
-
-try:
-    while simulation_app.is_running():
-        if phase == "go_home":
-            cur = tx60l.get_joint_positions().tolist()
-            alpha = min(1.0, step_counter / max(1, steps_to_home))
-            tgt = [cur[i] + (home[i] - cur[i]) * alpha for i in range(len(home))]
-            tx60l.apply_action(ArticulationAction(joint_positions=clamp(tgt)))
-            step_counter += 1
-            if alpha >= 1.0:
-                phase = "sine"
-                t = 0.0
+    try:
+        target, offset = _compute_robot_focus(robot_prim_path)
+        cam_pos = target + offset
+        transform = Gf.Matrix4d().SetLookAt(cam_pos, target, Gf.Vec3d(0.0, 0.0, 1.0))
+        xform = UsdGeom.Xformable(camera)
+        ops = xform.GetOrderedXformOps()
+        if ops:
+            ops[0].Set(transform)
         else:
-            q = tx60l.get_joint_positions().tolist()
-            if len(q) >= 1:
-                q[0] = home[0] + 0.3 * math.sin(t)
-            tx60l.apply_action(ArticulationAction(joint_positions=clamp(q)))
-            t += 0.03
+            xform.AddTransformOp().Set(transform)
+        print(f"[camera] Placed observer view at {cam_pos} looking at {target}.")
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[camera] Failed to place observer camera: {exc}")
 
-        world.step(render=True)
-finally:
-    wait_for_manual_gui_close()
-    simulation_app.close()
+
+def main():
+    ensure_basic_lighting()
+    world = create_world()
+    add_ground_plane(world)
+
+    robot = import_robot_from_urdf(world, URDF_ABS, robot_name="tx60l")
+    world.reset()
+
+    controller = JointMotionController(robot)
+    home = controller.home_pose([0.0, -0.8, 1.2, 0.0, 1.4, 0.0])
+    _place_observer_camera(robot.prim_path)
+
+    print("[motion] Moving to home pose...")
+    controller.move_smooth(world, home, duration=2.0)
+    print("[motion] Playing keyframe routine...")
+    controller.play_keyframes(world, _build_keyframes(home))
+
+    print("[motion] Oscillating selected joints...")
+    controller.oscillate(
+        world,
+        base_pose=home,
+        joints=[0, 1, 3, 5],
+        amplitude=0.3,
+        frequency=0.35,
+        duration=8.0,
+    )
+
+    print("[motion] Holding home pose...")
+    controller.hold_pose(world, home, duration=0.5)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+        wait_for_manual_gui_close(simulation_app)
+    finally:
+        simulation_app.close()
