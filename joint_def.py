@@ -1,54 +1,26 @@
 """
-Reusable helpers for setting up Isaac Sim scenes and commanding articulated arms.
+Joint-space utilities for TX60L and other articulated arms.
 
-Typical usage::
+Typical usage (環境建立請改用 Sim.py)::
 
-    from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": False})
-    from joint_def import (
-        ensure_basic_lighting,
-        create_world,
-        add_ground_plane,
-        import_robot_from_urdf,
-        JointMotionController,
-    )
-
-    ensure_basic_lighting()
-    world = create_world()
-    add_ground_plane(world)
-    robot = import_robot_from_urdf(world, "/abs/path/to/robot.urdf")
-    controller = JointMotionController(robot)
-    controller.move_smooth(world, controller.home_pose(), duration=2.0)
+    from joint_def import get_preset_pose, JointMotionController, Keyframe
 """
 
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
-import numpy as np
-import omni.usd
-from isaacsim.asset.importer.urdf import _urdf
 from omni.isaac.core import World
-from omni.isaac.core.objects.ground_plane import GroundPlane
 from omni.isaac.core.robots import Robot
 from omni.isaac.core.utils.types import ArticulationAction
-from pxr import Gf, UsdGeom, UsdLux
 
 __all__ = [
-    "ensure_basic_lighting",
-    "create_world",
-    "add_ground_plane",
-    "import_robot_from_urdf",
     "get_preset_pose",
     "Keyframe",
     "JointMotionController",
-    "wait_for_manual_gui_close",
 ]
-
-_urdf_interface = _urdf.acquire_urdf_interface()
 
 # Common joint-space presets (unit: rad). Extend as needed.
 PRESET_POSES = {
@@ -79,116 +51,6 @@ def get_preset_pose(
             raise ValueError(f"Unknown preset pose '{name}'.")
         pose = list(fallback)
     return list(pose)
-
-
-def ensure_basic_lighting(
-    dome_path: str = "/World/EnvLight",
-    sun_path: str = "/World/SunLight",
-    dome_intensity: float = 150.0,
-    sun_intensity: float = 10000.0,
-) -> None:
-    """
-    Guarantee a minimal lighting rig so imported geometry is visible.
-
-    呼叫時機：在匯入任何幾何或場景前執行一次即可。
-    Args/目的:
-        dome_path/sun_path: 可自訂的 USD path，避免重複建立。
-        dome_intensity/sun_intensity: 控制光源亮度。數值過大會讓金屬表面過曝、
-            阴影幾乎消失；過小則畫面偏暗、材質看不到細節。
-    """
-    stage = omni.usd.get_context().get_stage()
-    if not stage.GetPrimAtPath(dome_path):
-        dome = UsdLux.DomeLight.Define(stage, dome_path)
-        dome.CreateIntensityAttr(dome_intensity)
-        dome.CreateSpecularAttr(0.1)
-
-    if not stage.GetPrimAtPath(sun_path):
-        sun = UsdLux.DistantLight.Define(stage, sun_path)
-        sun.CreateIntensityAttr(sun_intensity)
-        sun.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.92))
-        xform = UsdGeom.Xformable(sun)
-        xform.AddRotateYOp().Set(-45.0)
-        xform.AddRotateXOp().Set(-60.0)
-
-
-def create_world(stage_units: float = 1.0, physics_dt: float = 1.0 / 60.0) -> World:
-    """
-    Create an Isaac World with optional unit/dt overrides.
-
-    Args:
-        stage_units: 一公尺對應的 Stage 單位，可保持模型尺度一致。
-            設太大會讓模型看起來縮小且數值尺度變小；設太小則會讓場景
-            看似放大，易與既有資產衝突。
-        physics_dt: 物理世界的時間步長，越小代表模擬越精細。
-            時間步太大會導致控制不穩且碰撞穿透，太小則需要更多計算資源。
-    用途:
-        在載入任何物件前先建立世界，後續所有 step 都呼叫此 world。
-    """
-    return World(stage_units_in_meters=stage_units, physics_dt=physics_dt)
-
-
-def add_ground_plane(
-    world: World,
-    path: str = "/World/Ground",
-    *,
-    size: float = 20.0,
-    color: Sequence[float] = (0.9, 0.9, 0.9),
-) -> None:
-    """
-    Insert a ground plane so the 機械手臂有支撐。
-
-    Args:
-        world: 由 create_world 建立的 World 物件。
-        path: USD prim path，可避免重複建立。
-        size: 平面大小；數值太小會讓物體容易掉出邊界，太大則增加渲染成本。
-        color: 平面顏色；太亮可能讓曝光不自然，太暗則難以判讀高度。
-    """
-    color_array = np.array(color, dtype=np.float32)
-    if not world.scene.get_object(path):
-        world.scene.add(GroundPlane(path, size=size, color=color_array))
-
-
-def import_robot_from_urdf(
-    world: World,
-    urdf_abs_path: str,
-    *,
-    robot_name: str = "robot",
-    fix_base: bool = True,
-    merge_fixed_joints: bool = False,
-    make_default_prim: bool = True,
-) -> Robot:
-    """
-    Parse and import a URDF robot, returning the wrapped Robot handle.
-
-    Args:
-        world: 目標 World。
-        urdf_abs_path: 機器人 URDF 絕對路徑。
-        robot_name: 建立於 World scene 中的名稱。
-        fix_base: True 會鎖住底座避免整隻機械手臂傾倒；False 可讓底座受力移動，
-            但若無地面約束可能倒下。
-        merge_fixed_joints: True 會把固定關節合成單一 link，減少 DOF；若模型需要
-            保留原關節層級則維持 False。
-        make_default_prim: 設為 True 可將機器人設為 Stage default prim，方便 USD 存檔；
-            若場景已有既定 default prim，可改 False 以避免覆蓋。
-    用途:
-        讓同一隻手臂在不同腳本中重複使用，不需每次重複 importer 邏輯。
-    """
-    if not os.path.isabs(urdf_abs_path):
-        raise ValueError("URDF path must be absolute to avoid relative stage issues.")
-
-    urdf_dir, urdf_file = os.path.split(urdf_abs_path)
-    import_cfg = _urdf.ImportConfig()
-    import_cfg.set_fix_base(fix_base)
-    import_cfg.set_merge_fixed_joints(merge_fixed_joints)
-    import_cfg.set_make_default_prim(make_default_prim)
-    import_cfg.set_create_physics_scene(True)
-
-    parsed_robot = _urdf_interface.parse_urdf(urdf_dir, urdf_file, import_cfg)
-    root_prim = _urdf_interface.import_robot(
-        urdf_dir, urdf_file, parsed_robot, import_cfg, "", True
-    )
-
-    return world.scene.add(Robot(prim_path=root_prim, name=robot_name))
 
 
 @dataclass
@@ -259,19 +121,6 @@ class JointMotionController:
         """
         return self._robot.get_joint_positions().tolist()
 
-    def apply_pose(self, pose: Sequence[float]) -> None:
-        """
-        Immediately command the robot to a pose (單步位置控制).
-
-        Args:
-            pose: 目標關節角列表。若角度過大超出限制，會先經 clamp 截斷；
-                若長度不足則自動 padding。過小（僅 1~2 軸）也可，未指定的軸會沿用當前值。
-        用途:
-            - 即時維持姿勢（例如急停 hold）。
-            - 逐步內插時每個 simulation step 呼叫本函式送出新 pose。
-        """
-        self._robot.apply_action(ArticulationAction(joint_positions=self.clamp(pose)))
-
     def home_pose(self, fallback: Sequence[float] | None = None) -> List[float]:
         """
         Return a sanitized home pose, optionally using a provided fallback.
@@ -285,6 +134,11 @@ class JointMotionController:
         if fallback is None:
             fallback = [0.0] * self.dof_count
         return self.clamp(fallback)
+
+    def apply_pose(self, pose: Sequence[float]) -> None: 
+        """Apply a joint pose immediately (no stepping or interpolation)."""
+        self._robot.apply_action(ArticulationAction(joint_positions=self.clamp(pose)))
+    
 
     def move_smooth(
         self,
@@ -405,17 +259,3 @@ class JointMotionController:
                 )
             self._robot.apply_action(ArticulationAction(joint_positions=self.clamp(pose)))
             world.step(render=render)
-
-
-def wait_for_manual_gui_close(simulation_app) -> None:
-    """
-    Block until the Isaac Sim GUI window is closed.
-
-    用途:
-        Isaac Sim 腳本執行完後若需保持 GUI 開啟，可呼叫此函式等待使用者關閉視窗。
-    """
-    if not simulation_app.is_running():
-        return
-    print("動作結束，請手動關閉 Isaac Sim GUI 視窗以結束程式。")
-    while simulation_app.is_running():
-        simulation_app.update()
