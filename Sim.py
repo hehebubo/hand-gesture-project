@@ -29,6 +29,9 @@ __all__ = [
 
 _urdf_interface = _urdf.acquire_urdf_interface()
 
+def create_world(stage_units: float = 1.0, physics_dt: float = 1.0 / 60.0) -> World:
+    """Create an Isaac World with optional unit/dt overrides."""
+    return World(stage_units_in_meters=stage_units, physics_dt=physics_dt)
 
 def ensure_basic_lighting(
     dome_path: str = "/World/EnvLight",

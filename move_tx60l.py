@@ -11,8 +11,6 @@ C 模式 (按鍵 3): 回到初始 home 姿勢並維持；若 C 後再切回 A，
 from __future__ import annotations
 
 import enum
-import sys
-import traceback
 from typing import Tuple
 
 from isaacsim import SimulationApp
@@ -138,7 +136,7 @@ class ModeManager:
         self._return_home = ReturnHomeAction(controller, self._home_pose, duration=2.5)
         self._mode = Mode.HOME
         self._hold_pose = self._home_pose[:]
-        self._cycle_reset_pending = True
+        self._cycle_reset_pending = True 
 
     def handle_mode_request(self, requested: Mode):
         if requested == Mode.LOOP:
@@ -194,19 +192,9 @@ class KeyboardModeSwitcher:
         self._mode_manager = mode_manager
         self._input = carb.input.acquire_input_interface()
         self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
-        self._subscription = None
-
-        if self._keyboard is None:
-            print("[keyboard] WARNING: no keyboard device found; hotkeys disabled.")
-            return
-
         self._subscription = self._input.subscribe_to_keyboard_events(
             self._keyboard, self._on_keyboard_event
         )
-        if self._subscription is None:
-            print("[keyboard] WARNING: failed to subscribe; hotkeys disabled.")
-        else:
-            print(f"[keyboard] subscribed to {self._keyboard}")
 
     def shutdown(self):
         if self._subscription is not None:
@@ -218,33 +206,16 @@ class KeyboardModeSwitcher:
             self._input = None
 
     def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
-        valid_types = [carb.input.KeyboardEventType.KEY_PRESS]
-        for extra in ("KEY_REPEAT", "KEY_DOWN"):
-            extra_type = getattr(carb.input.KeyboardEventType, extra, None)
-            if extra_type is not None:
-                valid_types.append(extra_type)
-
-        if event.type not in valid_types:
+        if event.type != carb.input.KeyboardEventType.KEY_PRESS:
             return False
 
-        print(f"[keyboard] event type={event.type} input={event.input}")
-
-        if event.input in (
-            carb.input.KeyboardInput.KEY_1,
-            getattr(carb.input.KeyboardInput, "KEY_KP_1", None),
-        ):
+        if event.input == carb.input.KeyboardInput.KEY_1:
             self._mode_manager.handle_mode_request(Mode.LOOP)
             return True
-        if event.input in (
-            carb.input.KeyboardInput.KEY_2,
-            getattr(carb.input.KeyboardInput, "KEY_KP_2", None),
-        ):
+        if event.input == carb.input.KeyboardInput.KEY_2:
             self._mode_manager.handle_mode_request(Mode.PAUSE)
             return True
-        if event.input in (
-            carb.input.KeyboardInput.KEY_3,
-            getattr(carb.input.KeyboardInput, "KEY_KP_3", None),
-        ):
+        if event.input == carb.input.KeyboardInput.KEY_3:
             self._mode_manager.handle_mode_request(Mode.RETURNING)
             return True
         return False
@@ -346,11 +317,6 @@ def _place_observer_camera(robot_prim_path: str) -> None:
 
 
 def main():
-    print("[main] starting main()...", flush=True)
-    # 先跑一次事件迴圈，讓 is_running 變為 True 並建好視窗。
-    simulation_app.update()
-    print(f"[main] after first update, is_running={simulation_app.is_running()}", flush=True)
-
     ensure_basic_lighting()
     world = create_world()
     add_ground_plane(world)
@@ -368,11 +334,9 @@ def main():
 
     print("[controls] 1 → A 模式 | 2 → B 模式 | 3 → C 模式。關閉 GUI 以結束程式。")
     mode_manager.handle_mode_request(Mode.LOOP)  # 預設開啟 A 模式
-    print("[main] entering main loop; close the GUI window to exit.")
 
     try:
-        while simulation_app.is_running():
-            simulation_app.update()
+        while simulation_app.update():
             dt = world.get_physics_dt()
             mode_manager.update(dt)
             world.step(render=True)
@@ -388,8 +352,6 @@ URDF_ABS = "/home/scl114/Documents/urdf_files_dataset-main/urdf_files/ros-indust
 if __name__ == "__main__":
     try:
         main()
-    except Exception:  # pragma: no cover - top-level safety
-        traceback.print_exc()
-        sys.stdout.flush()
+        wait_for_manual_gui_close(simulation_app)
     finally:
         simulation_app.close()
