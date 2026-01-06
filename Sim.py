@@ -12,11 +12,11 @@ import os
 from typing import Sequence
 
 import numpy as np
-import omni.usd
 from isaacsim.asset.importer.urdf import _urdf
-from omni.isaac.core import World
-from omni.isaac.core.objects.ground_plane import GroundPlane
-from omni.isaac.core.robots import Robot
+from isaacsim.core.api import World
+from isaacsim.core.api.objects import GroundPlane
+from isaacsim.core.api.robots import Robot
+from isaacsim.core.utils.stage import get_current_stage
 from pxr import Gf, UsdGeom, UsdLux
 
 __all__ = [
@@ -44,7 +44,7 @@ def ensure_basic_lighting(
 
     呼叫時機：在匯入任何幾何或場景前執行一次即可。
     """
-    stage = omni.usd.get_context().get_stage()
+    stage = get_current_stage()
     if not stage.GetPrimAtPath(dome_path):
         dome = UsdLux.DomeLight.Define(stage, dome_path)
         dome.CreateIntensityAttr(dome_intensity)
@@ -57,11 +57,6 @@ def ensure_basic_lighting(
         xform = UsdGeom.Xformable(sun)
         xform.AddRotateYOp().Set(-45.0)
         xform.AddRotateXOp().Set(-60.0)
-
-
-def create_world(stage_units: float = 1.0, physics_dt: float = 1.0 / 60.0) -> World:
-    """Create an Isaac World with optional unit/dt overrides."""
-    return World(stage_units_in_meters=stage_units, physics_dt=physics_dt)
 
 
 def add_ground_plane(
@@ -107,7 +102,7 @@ def import_robot_from_urdf(
 
 def wait_for_manual_gui_close(simulation_app) -> None:
     """Block until the Isaac Sim GUI window is closed."""
-    if not simulation_app.is_running():
+    if not simulation_app.is_running(): 
         return
     print("動作結束，請手動關閉 Isaac Sim GUI 視窗以結束程式。")
     while simulation_app.is_running():

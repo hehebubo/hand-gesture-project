@@ -12,9 +12,9 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
-from omni.isaac.core import World
-from omni.isaac.core.robots import Robot
-from omni.isaac.core.utils.types import ArticulationAction
+from isaacsim.core.api import World
+from isaacsim.core.api.robots import Robot
+from isaacsim.core.utils.types import ArticulationAction
 
 __all__ = [
     "get_preset_pose",
