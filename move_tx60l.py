@@ -190,8 +190,8 @@ def main():
 
         # [MODIFIED] use metric coordinates from hand.py in robot frame
         teleop_ctrl = TeleopController(
-            target_center=(0.0, 0.0, 0.0),
-            target_gain=(1.0, 1.0, 1.0),
+            target_center=(0.90, 0.0, 0.0),
+            target_gain=(-1.0, -1.0, 1.0),
             workspace_bounds={
                 "x": (0.10, 0.80),
                 "y": (-0.30, 0.30),
