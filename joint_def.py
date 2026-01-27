@@ -113,6 +113,16 @@ class JointMotionController:
             for i in range(self.dof_count)
         ]
 
+    def within_limits(self, values: Sequence[float], *, tol: float = 0.0) -> bool:
+        """
+        Check if values are within joint limits (with optional tolerance).
+        """
+        padded = self._pad(values)
+        for i in range(self.dof_count):
+            if padded[i] < (self._lower[i] - tol) or padded[i] > (self._upper[i] + tol):
+                return False
+        return True
+
     def current_pose(self) -> List[float]:
         """
         Read current joint angles as a list.

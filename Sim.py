@@ -21,6 +21,8 @@ from pxr import Gf, UsdGeom, UsdLux
 
 __all__ = [
     "ensure_basic_lighting",
+    "use_default_lighting",
+    "use_default_light_rig",
     "create_world",
     "add_ground_plane",
     "import_robot_from_urdf",
@@ -57,6 +59,65 @@ def ensure_basic_lighting(
         xform = UsdGeom.Xformable(sun)
         xform.AddRotateYOp().Set(-45.0)
         xform.AddRotateXOp().Set(-60.0)
+
+def use_default_lighting(
+    dome_path: str = "/World/EnvLight",
+    sun_path: str = "/World/SunLight",
+) -> None:
+    """
+    Remove custom lights so the viewport uses its default lighting.
+
+    Call this before adding any custom lights if you want the stage defaults.
+    """
+    stage = get_current_stage()
+    if stage.GetPrimAtPath(dome_path):
+        stage.RemovePrim(dome_path)
+    if stage.GetPrimAtPath(sun_path):
+        stage.RemovePrim(sun_path)
+
+def use_default_light_rig(rig_name: str = "Default", *, enable_auto_rig: bool = True) -> None:
+    """
+    Switch the viewport lighting to the built-in light rig (e.g. "Default").
+
+    This matches the Viewport menu: Light Rigs -> Default.
+    """
+    try:
+        from isaacsim.core.utils.extensions import enable_extension
+
+        enable_extension("omni.kit.viewport.menubar.lighting")
+    except Exception:
+        pass
+
+    # Remove any custom stage lights so the rig is the only illumination source.
+    use_default_lighting()
+
+    try:
+        import carb
+        import omni.usd
+        from omni.kit.viewport.menubar.lighting import actions as lighting_actions
+        from omni.kit.viewport.menubar.lighting.utility import _get_rig_names_and_paths
+
+        if enable_auto_rig:
+            carb.settings.get_settings().set(
+                "/persistent/exts/omni.kit.viewport.menubar.lighting/autoLightRig/enabled",
+                True,
+            )
+
+        rigs = _get_rig_names_and_paths("omni.kit.viewport.menubar.lighting") or []
+        rig_names = [name for name, _ in rigs if name]
+        if rig_names and rig_name not in rig_names:
+            rig_name = rig_names[0]
+
+        carb.settings.get_settings().set(
+            "/exts/omni.kit.viewport.menubar.lighting/defaultRig", rig_name
+        )
+
+        lighting_actions._set_lighting_mode(
+            rig_name, usd_context=omni.usd.get_context()
+        )
+    except Exception:
+        # Fail silently if the viewport lighting extension is unavailable.
+        pass
 
 
 def add_ground_plane(

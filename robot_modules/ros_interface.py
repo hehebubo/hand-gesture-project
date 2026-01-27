@@ -7,12 +7,14 @@ from __future__ import annotations
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import importlib.util
+import math
 import numpy as np
 import omni.graph.core as og
 import omni.usd
 import os
 import random
 import sys
+from isaacsim.core.utils.types import ArticulationAction
 
 if TYPE_CHECKING:
     from joint_def import JointMotionController
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
 
 
 _OG_POSE_UNAVAILABLE = False
+ROS2_HAND_TARGET_TOPIC = "/hand/right/pose"  # original: /hand_target
 
 
 def _clip_workspace(pos: np.ndarray, bounds) -> np.ndarray:
@@ -46,6 +49,64 @@ def _normalize_pose(pos, quat) -> Tuple[Optional[np.ndarray], Optional[np.ndarra
         return pos_np, quat_np
     except Exception:
         return None, None
+
+
+def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    x1, y1, z1, w1 = [float(v) for v in q1]
+    x2, y2, z2, w2 = [float(v) for v in q2]
+    return np.array(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _quat_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float64).reshape(3)
+    n = np.linalg.norm(axis)
+    if n == 0.0:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    axis = axis / n
+    half = 0.5 * float(angle)
+    s = math.sin(half)
+    return np.array([axis[0] * s, axis[1] * s, axis[2] * s, math.cos(half)], dtype=np.float64)
+
+
+def _quat_to_pitch_xyzw(quat: np.ndarray) -> float:
+    x, y, z, w = [float(v) for v in quat]
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        return math.copysign(math.pi / 2.0, sinp)
+    return math.asin(sinp)
+
+def _quat_to_roll_xyzw(quat: np.ndarray) -> float:
+    x, y, z, w = [float(v) for v in quat]
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    return math.atan2(sinr, cosr)
+
+def _wrap_angles_to_reference(angles: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Wrap each angle to the closest equivalent around reference."""
+    angles = np.asarray(angles, dtype=np.float64).reshape(-1)
+    reference = np.asarray(reference, dtype=np.float64).reshape(-1)
+    if angles.size != reference.size:
+        return angles
+    diff = angles - reference
+    diff = (diff + math.pi) % (2.0 * math.pi) - math.pi
+    return reference + diff
+
+
+def _axis_from_name(axis: str) -> np.ndarray:
+    name = (axis or "").lower()
+    if name == "x":
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if name == "z":
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
 
 def _read_pose_from_og(node_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -108,12 +169,14 @@ def _ensure_internal_rclpy_on_path(ros_distro: str) -> None:
         sys.path.append(candidate)
 
 
-def build_ros2_hand_target_graph(topic_name: str = "/hand_target") -> str:
+def build_ros2_hand_target_graph(topic_name: Optional[str] = None) -> str:
     """
     Build OmniGraph nodes for hand target pose.
     [Fix] Removed inputs:queueSize to avoid missing-attr failures.
     """
     global _OG_POSE_UNAVAILABLE
+    if topic_name is None:
+        topic_name = ROS2_HAND_TARGET_TOPIC
     if _OG_POSE_UNAVAILABLE:
         return ""
 
@@ -165,7 +228,7 @@ def build_ros2_hand_target_graph(topic_name: str = "/hand_target") -> str:
                 og,
                 sub_path,
                 ["inputs:messageName", "inputs:msgName", "inputs:message_name"],
-                "Pose",
+                "PoseStamped",
                 label="message name",
             )
             if not (pkg_set or name_set):
@@ -173,7 +236,7 @@ def build_ros2_hand_target_graph(topic_name: str = "/hand_target") -> str:
                     og,
                     sub_path,
                     ["inputs:messageType", "inputs:msgType", "inputs:messageTypeName", "inputs:msgTypeName"],
-                    "geometry_msgs/msg/Pose",
+                    "geometry_msgs/msg/PoseStamped",
                     label="message type",
                 )
             print("[ROS-OG] Graph created")
@@ -205,7 +268,7 @@ class HandTargetIKBridge:
         controller: "JointMotionController",
         ee_prim_path: str,
         graph_path: str,
-        topic_name: str = "/hand_target",
+        topic_name: Optional[str] = None,
         enable_rclpy_fallback: bool = True,
         prefer_rclpy: bool = False,
         publish_ik: bool = False,
@@ -216,13 +279,22 @@ class HandTargetIKBridge:
         low_pass_alpha: float = 0.05,
         max_step: float = 0.0015,
         workspace_bounds: Optional[dict] = None,
+        log_limit_xyz: Optional[Tuple[float, float, float]] = None,
+        log_limit_eps: float = 1e-4,
+        hold_on_failure: bool = True,
+        reject_on_limit_violation: bool = True,
+        limit_violation_tol: float = 1e-3,
+        preferred_seed: Optional[np.ndarray] = None,
+        wrap_to_previous: bool = True,
+        max_joint_jump: Optional[float] = None,
+        target_jump_override: Optional[float] = None,
     ):
         self.robot = robot
         self._controller = controller
         self.ee_prim_path = ee_prim_path
         self.graph_path = graph_path
         self.node_path = f"{graph_path}/SubPose"
-        self._topic_name = topic_name
+        self._topic_name = topic_name if topic_name is not None else ROS2_HAND_TARGET_TOPIC
         self._use_rclpy = False
         self._rclpy_sub = None
         self._allow_rclpy_fallback = bool(enable_rclpy_fallback)
@@ -245,9 +317,30 @@ class HandTargetIKBridge:
         self.low_pass_alpha = float(low_pass_alpha)
         self.max_step = float(max_step)
         self.workspace_bounds = workspace_bounds
+        self.log_limit_xyz = log_limit_xyz
+        self.log_limit_eps = float(log_limit_eps)
+        self._hold_on_failure = bool(hold_on_failure)
+        self._reject_on_limit_violation = bool(reject_on_limit_violation)
+        self._limit_violation_tol = float(limit_violation_tol)
+        self._preferred_seed: Optional[np.ndarray] = None
+        self._wrap_to_previous = bool(wrap_to_previous)
+        self._max_joint_jump = max_joint_jump if max_joint_jump is None else float(max_joint_jump)
+        self._target_jump_override = (
+            target_jump_override if target_jump_override is None else float(target_jump_override)
+        )
+        if preferred_seed is not None:
+            try:
+                self._preferred_seed = np.asarray(preferred_seed, dtype=np.float64).reshape(-1)
+            except Exception:
+                self._preferred_seed = None
         self._last_target: Optional[np.ndarray] = None
         self._filtered_target: Optional[np.ndarray] = None
         self._prev_cmd_target: Optional[np.ndarray] = None
+        self._prev_cmd_joint: Optional[np.ndarray] = None
+        self._hand_pitch_zero: Optional[float] = None
+        self._hand_roll_zero: Optional[float] = None
+        self.last_target_pos: Optional[np.ndarray] = None
+        self.last_raw_pos: Optional[np.ndarray] = None
         if (self._prefer_rclpy or not self.graph_path) and self._allow_rclpy_fallback:
             self._init_rclpy_fallback()
         if self._publish_ik:
@@ -286,7 +379,17 @@ class HandTargetIKBridge:
             print(f"[ROS] IK publisher unavailable: {exc}")
             self._ik_pub = None
 
-    def update(self, teleop_ctrl=None, fixed_quat=None, fixed_z: Optional[float] = None, seed=None):
+    def update(
+        self,
+        teleop_ctrl=None,
+        fixed_quat=None,
+        fixed_z: Optional[float] = None,
+        seed=None,
+        hand_pitch_gain: Optional[float] = None,
+        hand_pitch_axis: str = "y",
+        hand_roll_gain: Optional[float] = None,
+        hand_roll_axis: str = "x",
+    ):
         if not self._ik:
             return
         pos = None
@@ -315,6 +418,10 @@ class HandTargetIKBridge:
             raw_pos = np.array2string(np.asarray(pos, dtype=np.float64), precision=4, suppress_small=True)
             raw_quat = np.array2string(np.asarray(quat, dtype=np.float64), precision=4, suppress_small=True)
             print(f"[ROS-IK] raw_pos={raw_pos} raw_quat={raw_quat}")
+
+        raw_pos = np.asarray(pos, dtype=np.float64).reshape(-1)
+        if raw_pos.size >= 3 and np.all(np.isfinite(raw_pos[:3])):
+            self.last_raw_pos = raw_pos[:3].copy()
 
         target_pos = teleop_ctrl.process(pos) if teleop_ctrl else pos
         target_pos = np.asarray(target_pos, dtype=np.float64).reshape(-1)
@@ -351,20 +458,79 @@ class HandTargetIKBridge:
         if bounds is None and teleop_ctrl is not None:
             bounds = getattr(teleop_ctrl, "workspace_bounds", None)
         target_pos = _clip_workspace(target_pos, bounds)
+        prev_target = self._prev_cmd_target
         self._prev_cmd_target = target_pos.copy()
+        self.last_target_pos = target_pos.copy()
 
         quat_use = fixed_quat if fixed_quat is not None else quat
+        if (hand_pitch_gain is not None or hand_roll_gain is not None) and quat is not None:
+            base = fixed_quat if fixed_quat is not None else quat_use
+            delta_q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+            if hand_pitch_gain is not None:
+                pitch = _quat_to_pitch_xyzw(np.asarray(quat, dtype=np.float64))
+                if self._hand_pitch_zero is None:
+                    self._hand_pitch_zero = pitch
+                delta_pitch = (pitch - self._hand_pitch_zero) * float(hand_pitch_gain)
+                delta_q_pitch = _quat_from_axis_angle(
+                    _axis_from_name(hand_pitch_axis), delta_pitch
+                )
+                delta_q = _quat_mul(delta_q, delta_q_pitch)
+            if hand_roll_gain is not None:
+                roll = _quat_to_roll_xyzw(np.asarray(quat, dtype=np.float64))
+                if self._hand_roll_zero is None:
+                    self._hand_roll_zero = roll
+                delta_roll = (roll - self._hand_roll_zero) * float(hand_roll_gain)
+                delta_q_roll = _quat_from_axis_angle(
+                    _axis_from_name(hand_roll_axis), delta_roll
+                )
+                delta_q = _quat_mul(delta_q, delta_q_roll)
+            quat_use = _quat_mul(base, delta_q)
+            n = np.linalg.norm(quat_use)
+            if n > 0.0:
+                quat_use = quat_use / n
 
         if seed is None:
             seed = self._last_seed
+        if seed is None and self._preferred_seed is not None:
+            seed = self._preferred_seed
         if seed is None and self._controller:
             try:
                 seed = np.array(self._controller.current_pose(), dtype=np.float64)
             except Exception:
                 pass
         if do_log:
-            tgt = np.array2string(target_pos, precision=4, suppress_small=True)
-            quat_fmt = np.array2string(np.asarray(quat_use, dtype=np.float64), precision=4, suppress_small=True)
+            eps = self.log_limit_eps
+            limit_bounds = None
+            if self.log_limit_xyz is not None:
+                limits = self.log_limit_xyz
+                limit_bounds = {
+                    "x": (-abs(float(limits[0])), abs(float(limits[0]))),
+                    "y": (-abs(float(limits[1])), abs(float(limits[1]))),
+                    "z": (-abs(float(limits[2])), abs(float(limits[2]))),
+                }
+            elif isinstance(bounds, dict):
+                limit_bounds = bounds
+
+            if limit_bounds:
+                axis_labels = []
+                for axis, val in zip(("x", "y", "z"), target_pos):
+                    if axis in limit_bounds:
+                        lo, hi = limit_bounds[axis]
+                        lo = float(lo)
+                        hi = float(hi)
+                        if lo > hi:
+                            lo, hi = hi, lo
+                        mark = "*" if (val <= lo + eps or val >= hi - eps) else ""
+                        axis_labels.append(f"{axis}={val:.4f}{mark}")
+                    else:
+                        axis_labels.append(f"{axis}={val:.4f}")
+                tgt = "{" + ", ".join(axis_labels) + "}"
+            else:
+                tgt = np.array2string(target_pos, precision=4, suppress_small=True)
+
+            quat_fmt = np.array2string(
+                np.asarray(quat_use, dtype=np.float64), precision=4, suppress_small=True
+            )
             seed_flag = "set" if seed is not None else "none"
             print(f"[ROS-IK] target_pos={tgt} quat={quat_fmt} seed={seed_flag}")
 
@@ -394,6 +560,13 @@ class HandTargetIKBridge:
         if (not success) or action is None:
             if do_log:
                 print(f"[ROS-IK] solve failed (success={success})")
+            if self._hold_on_failure and self._prev_cmd_joint is not None and self.art_ctrl:
+                try:
+                    self.art_ctrl.apply_action(
+                        ArticulationAction(joint_positions=self._prev_cmd_joint)
+                    )
+                except Exception:
+                    pass
             return
 
         jp = getattr(action, "joint_positions", None)
@@ -401,9 +574,67 @@ class HandTargetIKBridge:
             joint_positions = np.asarray(jp, dtype=np.float64).reshape(-1)
             if joint_positions.size == 0 or not np.all(np.isfinite(joint_positions)):
                 return
+            if self._prev_cmd_joint is not None and self._wrap_to_previous:
+                wrapped = _wrap_angles_to_reference(joint_positions, self._prev_cmd_joint)
+                if (
+                    self._controller is not None
+                    and hasattr(self._controller, "within_limits")
+                    and self._controller.within_limits(wrapped, tol=self._limit_violation_tol)
+                ):
+                    joint_positions = wrapped
+
+            if self._prev_cmd_joint is not None and self._max_joint_jump is not None:
+                allow_jump = False
+                if prev_target is not None and self._target_jump_override is not None:
+                    try:
+                        dist = float(np.linalg.norm(target_pos - prev_target))
+                        if dist >= self._target_jump_override:
+                            allow_jump = True
+                    except Exception:
+                        pass
+                if not allow_jump:
+                    delta = np.abs(joint_positions - self._prev_cmd_joint)
+                    if np.max(delta) > self._max_joint_jump:
+                        if do_log:
+                            print("[ROS-IK] joint jump too large; skip apply")
+                        if self._hold_on_failure and self._prev_cmd_joint is not None and self.art_ctrl:
+                            try:
+                                self.art_ctrl.apply_action(
+                                    ArticulationAction(joint_positions=self._prev_cmd_joint)
+                                )
+                            except Exception:
+                                pass
+                        return
+            if (
+                self._reject_on_limit_violation
+                and self._controller is not None
+                and hasattr(self._controller, "within_limits")
+            ):
+                try:
+                    within = self._controller.within_limits(
+                        joint_positions, tol=self._limit_violation_tol
+                    )
+                except Exception:
+                    within = True
+                if not within:
+                    if do_log:
+                        print("[ROS-IK] joint out of limits; skip apply")
+                    if self._hold_on_failure and self._prev_cmd_joint is not None and self.art_ctrl:
+                        try:
+                            self.art_ctrl.apply_action(
+                                ArticulationAction(joint_positions=self._prev_cmd_joint)
+                            )
+                        except Exception:
+                            pass
+                    return
+            self._prev_cmd_joint = joint_positions.copy()
             if do_log:
                 jp_fmt = np.array2string(joint_positions, precision=4, suppress_small=True)
                 print(f"[ROS-IK] joint_positions={jp_fmt}")
+            try:
+                action.joint_positions = joint_positions
+            except Exception:
+                pass
             if self._ik_pub:
                 self._ik_pub.publish(joint_positions)
 
@@ -417,16 +648,29 @@ class HandTargetIKBridge:
         self._last_target = None
         self._filtered_target = None
         self._prev_cmd_target = None
+        self._prev_cmd_joint = None
+        self._hand_pitch_zero = None
+        self._hand_roll_zero = None
+        self.last_target_pos = None
+        self.last_raw_pos = None
+
+    def set_preferred_seed(self, seed) -> None:
+        try:
+            self._preferred_seed = np.asarray(seed, dtype=np.float64).reshape(-1)
+        except Exception:
+            self._preferred_seed = None
 
 
 class _RclpyHandPoseSubscriber:
-    def __init__(self, topic: str = "/hand_target"):
+    def __init__(self, topic: Optional[str] = None): #mediapipe: /hand_target wilor: /hand/right/pose
+        if topic is None:
+            topic = ROS2_HAND_TARGET_TOPIC
         self._topic = topic
         self._latest: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
         import rclpy
         from rclpy.node import Node
-        from geometry_msgs.msg import Pose
+        from geometry_msgs.msg import PoseStamped
 
         if not rclpy.ok():
             rclpy.init(args=None)
@@ -436,12 +680,13 @@ class _RclpyHandPoseSubscriber:
 
         self._node = _N("isaac_hand_target_sub")
         self._sub_pose = self._node.create_subscription(
-            Pose, topic, self._cb_pose, 10
+            PoseStamped, topic, self._cb_pose, 10
         )
 
     def _cb_pose(self, msg):
-        p = msg.position
-        o = msg.orientation
+        pose = msg.pose if hasattr(msg, "pose") else msg
+        p = pose.position
+        o = pose.orientation
         p = np.array([p.x, p.y, p.z], dtype=np.float64)
         q = np.array([o.x, o.y, o.z, o.w], dtype=np.float64)
         self._latest = (p, q)

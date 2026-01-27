@@ -107,11 +107,14 @@ class ModeManager:
         home_pose,
         routine: LoopRoutine,
         ik_bridge: "HandTargetIKBridge | None" = None,
+        return_home_duration: float = 2.5,
     ):
         self._controller = controller
         self._home_pose = controller.clamp(home_pose)
         self._routine = routine
-        self._return_home = ReturnHomeAction(controller, self._home_pose, duration=2.5)
+        self._return_home = ReturnHomeAction(
+            controller, self._home_pose, duration=return_home_duration
+        )
         self._mode = Mode.HOME
         self._hold_pose = self._home_pose[:]
 
